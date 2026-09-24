@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -65,12 +65,14 @@ CREATE TABLE IF NOT EXISTS batches (
     created_at TEXT NOT NULL,
     started_at TEXT,
     sealed_at TEXT,
+    current_round_seq INTEGER NOT NULL DEFAULT 0 CHECK (current_round_seq >= 0),
     FOREIGN KEY (protocol_id, protocol_version) REFERENCES protocol_catalog(protocol_id, version)
 );
 
 CREATE TABLE IF NOT EXISTS observations (
     observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    round_seq INTEGER NOT NULL DEFAULT 0 CHECK (round_seq >= 0),
     source_batch TEXT NOT NULL,
     source_row TEXT NOT NULL,
     robot_id TEXT NOT NULL REFERENCES robots(robot_id),
@@ -112,6 +114,7 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     job_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
     batch_revision INTEGER NOT NULL,
+    round_seq INTEGER NOT NULL DEFAULT 0 CHECK (round_seq >= 0),
     state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     available_at TEXT NOT NULL,
@@ -127,6 +130,7 @@ CREATE TABLE IF NOT EXISTS analyses (
     analysis_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
     batch_revision INTEGER NOT NULL,
+    round_seq INTEGER NOT NULL DEFAULT 0 CHECK (round_seq >= 0),
     protocol_sha256 TEXT NOT NULL CHECK (length(protocol_sha256) = 64),
     input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
     algorithm_version TEXT NOT NULL,
@@ -141,11 +145,47 @@ CREATE TABLE IF NOT EXISTS decisions (
     decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id TEXT NOT NULL REFERENCES batches(batch_id),
     analysis_id INTEGER NOT NULL REFERENCES analyses(analysis_id),
+    round_seq INTEGER NOT NULL DEFAULT 0 CHECK (round_seq >= 0),
     decision TEXT NOT NULL CHECK (decision IN ('needs_more_data', 'approved', 'rejected')),
     reason TEXT NOT NULL,
     decided_by TEXT NOT NULL REFERENCES users(user_id),
     decided_at TEXT NOT NULL,
     UNIQUE (batch_id, analysis_id)
+);
+
+CREATE TABLE IF NOT EXISTS supplement_plans (
+    plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    decision_id INTEGER NOT NULL REFERENCES decisions(decision_id),
+    analysis_id INTEGER NOT NULL REFERENCES analyses(analysis_id),
+    batch_revision INTEGER NOT NULL,
+    round_seq INTEGER NOT NULL CHECK (round_seq > 0),
+    note TEXT,
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE (batch_id, round_seq)
+);
+
+CREATE TABLE IF NOT EXISTS supplement_plan_items (
+    plan_id INTEGER NOT NULL REFERENCES supplement_plans(plan_id),
+    stratum_key TEXT NOT NULL,
+    minimum_count INTEGER NOT NULL CHECK (minimum_count > 0),
+    PRIMARY KEY (plan_id, stratum_key)
+);
+
+CREATE TABLE IF NOT EXISTS supplement_rounds (
+    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    round_seq INTEGER NOT NULL CHECK (round_seq > 0),
+    plan_id INTEGER NOT NULL REFERENCES supplement_plans(plan_id),
+    batch_revision_opened INTEGER NOT NULL,
+    batch_revision_sealed INTEGER,
+    state TEXT NOT NULL CHECK (state IN ('open', 'sealed')),
+    opened_by TEXT NOT NULL REFERENCES users(user_id),
+    opened_at TEXT NOT NULL,
+    sealed_by TEXT REFERENCES users(user_id),
+    sealed_at TEXT,
+    PRIMARY KEY (batch_id, round_seq),
+    UNIQUE (plan_id)
 );
 
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -162,8 +202,18 @@ CREATE TABLE IF NOT EXISTS audit_events (
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "analyses", "decisions", "supplement_plans", "supplement_plan_items",
+    "supplement_rounds", "audit_events",
 })
+
+# 旧版数据库上需要补齐的列：表名 -> (列名, 列定义)。
+_ADDED_COLUMNS = (
+    ("batches", "current_round_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("observations", "round_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("analyses", "round_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("decisions", "round_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("analysis_jobs", "round_seq", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -194,7 +244,19 @@ def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    # 对旧版数据库做仅追加列的幂等迁移，保留全部历史数据。
     with transaction(connection, immediate=True):
+        for table, column, definition in _ADDED_COLUMNS:
+            existing = {
+                row["name"]
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS observations_batch_round "
+            "ON observations(batch_id, round_seq)"
+        )
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
