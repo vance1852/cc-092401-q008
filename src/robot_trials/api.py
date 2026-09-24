@@ -133,6 +133,25 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            if method == "POST" and path == "/supplement-plans":
+                result = self.service.issue_supplement_plan(
+                    self._actor(normalized_headers), payload["batch_id"], int(payload["decision_id"]),
+                    payload["items"], payload.get("note"),
+                )
+                return Response(201, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "rounds":
+                result = self.service.open_resampling_round(
+                    self._actor(normalized_headers), parts[1], int(payload["plan_id"])
+                )
+                return Response(201, result)
+            if (
+                method == "POST" and len(parts) == 5
+                and parts[0] == "batches" and parts[2] == "rounds" and parts[4] == "seal"
+            ):
+                result = self.service.seal_resampling_round(
+                    self._actor(normalized_headers), parts[1], int(parts[3])
+                )
+                return Response(200, result)
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
